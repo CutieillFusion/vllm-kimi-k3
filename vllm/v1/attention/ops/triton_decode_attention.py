@@ -311,6 +311,7 @@ def _fwd_grouped_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     IS_MLA: tl.constexpr = False,
+    FP8_DS_MLA: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -339,7 +340,8 @@ def _fwd_grouped_kernel_stage1(
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        mask_dpe = offs_dpe < Lk
+        dpe_limit: tl.constexpr = BLOCK_DMODEL + BLOCK_DPE if FP8_DS_MLA else Lk
+        mask_dpe = offs_dpe < dpe_limit
         off_qpe = (
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
@@ -389,19 +391,40 @@ def _fwd_grouped_kernel_stage1(
                 cache_modifier=".cg",
             )
 
-            if k.dtype.is_fp8():
+            if FP8_DS_MLA:
+                scale_idx = tl.arange(0, 4)
+                scale_ptr = K_Buffer + kv_off_k[None, :] + 512 + scale_idx[:, None] * 4
+                scale_bits = tl.load(scale_ptr).to(tl.uint32)
+                scale_bits |= tl.load(scale_ptr + 1).to(tl.uint32) << 8
+                scale_bits |= tl.load(scale_ptr + 2).to(tl.uint32) << 16
+                scale_bits |= tl.load(scale_ptr + 3).to(tl.uint32) << 24
+                tile_scale = scale_bits.to(tl.float32, bitcast=True)
+                k = k.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                k = tl.reshape(k, (4, 128, BLOCK_N))
+                k = tl.reshape(k * tile_scale[:, None, :], (512, BLOCK_N))
+                k = k.to(q.dtype)
+            elif k.dtype.is_fp8():
                 k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                    other=0.0,
-                    cache_modifier=".cg",
-                )
-                if kpe.dtype.is_fp8():
-                    kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
+                if FP8_DS_MLA:
+                    rope_idx = offs_dpe - BLOCK_DMODEL
+                    rope_ptr = (
+                        K_Buffer + kv_off_k[None, :] + 528 + rope_idx[:, None] * 2
+                    )
+                    rope_bits = tl.load(rope_ptr).to(tl.uint16)
+                    rope_bits |= tl.load(rope_ptr + 1).to(tl.uint16) << 8
+                    kpe = rope_bits.to(tl.bfloat16, bitcast=True)
+                else:
+                    offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                        cache_modifier=".cg",
+                    )
+                    if kpe.dtype.is_fp8():
+                        kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
@@ -481,6 +504,7 @@ def _decode_grouped_att_m_fwd(
     k_scale,
     v_scale,
     is_mla=False,
+    fp8_ds_mla=False,
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
@@ -489,7 +513,7 @@ def _decode_grouped_att_m_fwd(
 
     # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
     if is_mla:
-        if not is_hip_ and Lk == 576:
+        if fp8_ds_mla or not is_hip_ and Lk == 576:
             BLOCK_DMODEL = 512
             BLOCK_DPE = 64
         elif not is_hip_ and Lk == 288:
@@ -568,6 +592,7 @@ def _decode_grouped_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         IS_MLA=is_mla,
+        FP8_DS_MLA=fp8_ds_mla,
         **extra_kargs,
     )
 
@@ -732,6 +757,7 @@ def decode_attention_fwd_grouped(
     k_scale=None,
     v_scale=None,
     is_mla=False,
+    fp8_ds_mla=False,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -747,6 +773,7 @@ def decode_attention_fwd_grouped(
         k_scale,
         v_scale,
         is_mla=is_mla,
+        fp8_ds_mla=fp8_ds_mla,
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits
@@ -769,8 +796,10 @@ def decode_attention_fwd(
     k_scale=None,
     v_scale=None,
     is_mla=False,
+    fp8_ds_mla=False,
 ):
     assert num_kv_splits == attn_logits.shape[2]
+    assert not fp8_ds_mla or is_mla
 
     if k_scale is None:
         k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
@@ -815,4 +844,5 @@ def decode_attention_fwd(
             k_scale,
             v_scale,
             is_mla=is_mla,
+            fp8_ds_mla=fp8_ds_mla,
         )
