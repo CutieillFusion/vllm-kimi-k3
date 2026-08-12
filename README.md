@@ -19,6 +19,193 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## Boot Kimi-K3 on four NVIDIA DGX Sparks
+
+This fork can serve the converted Kimi-K3 1-bit model across four DGX Spark
+systems with one GB10 GPU per node. The validated topology is TP=2, PP=2, and
+expert parallelism across all four GPUs. All 896 experts remain resident and
+the FP8 DS-MLA KV cache supports the full 1,048,576-token context length.
+
+### 1. Prepare every Spark
+
+The four nodes must be able to reach each other over the same private network.
+The examples below call them `spark1` through `spark4`, with `spark1` as the
+Ray head and OpenAI API server.
+
+Install the same checkout and Python environment at the same path on every
+node. Building vLLM on a Spark takes about 25-30 minutes, so keep the checkout
+on persistent storage rather than `/tmp`.
+
+```bash
+git clone --branch cuda-k3-fp8-ds-mla \
+  https://github.com/CutieillFusion/vllm-kimi-k3.git ~/k3vllm
+cd ~/k3vllm
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python 3.12
+uv pip install -e . --torch-backend=auto
+```
+
+Each node needs roughly 121 GB of unified memory available to vLLM. Stop other
+GPU workloads before loading the model.
+
+### 2. Place the converted model on every node
+
+Set `MODEL` to a local path visible at the same location on every Spark. The
+model must contain the dense checkpoint and all four converted expert stores:
+
+```text
+Kimi-K3-w1/
+├── config.json
+├── model-*.safetensors
+├── tokenizer files
+└── k3_w1/
+    ├── pp0-tp0/experts.w2
+    ├── pp0-tp1/experts.w2
+    ├── pp1-tp0/experts.w2
+    └── pp1-tp1/experts.w2
+```
+
+If starting from an official Kimi-K3 checkpoint, convert it once and then copy
+the resulting directory to all four nodes:
+
+```bash
+cd ~/k3vllm
+.venv/bin/python tools/k3_w1/convert_model.py \
+  --model /models/Kimi-K3 \
+  --output /models/Kimi-K3-w1
+```
+
+The conversion requires substantial temporary disk space and produces about
+426 GB of expert stores. See
+[`docs/features/quantization/k3_w1.md`](docs/features/quantization/k3_w1.md)
+for the format and preparation details.
+
+### 3. Configure networking on all four nodes
+
+Choose the private interface used between the Sparks and substitute the real
+head IP below. Run this block in every shell that starts Ray or vLLM. Set
+`NODE_IP` to that machine's address.
+
+```bash
+cd ~/k3vllm
+source .venv/bin/activate
+
+export HEAD_IP=192.168.0.10       # private IP of spark1
+export NODE_IP=192.168.0.10       # this node's private IP
+export CLUSTER_IFACE=enP7s7       # this node's private-network interface
+
+export VLLM_HOST_IP="$NODE_IP"
+export MASTER_ADDR="$HEAD_IP"
+export GLOO_SOCKET_IFNAME="$CLUSTER_IFACE"
+export NCCL_SOCKET_IFNAME="$CLUSTER_IFACE"
+export NCCL_IB_DISABLE=1
+export VLLM_DISTRIBUTED_TIMEOUT_SECONDS=3600
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=7200
+export VLLM_PP_LAYER_PARTITION=47,46
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export RAY_memory_monitor_refresh_ms=0
+
+export K3_BITS=4
+export K3_GROUP=64
+export K3_MLA_BITS=8
+export K3_HEAD_BITS=8
+export K3_QUANT_EMBED=1
+```
+
+`NCCL_IB_DISABLE=1` uses the private Ethernet network and is the most portable
+way to bring up the cluster. RoCE can be enabled later after selecting the
+correct local RoCEv2 GID index on each node.
+
+### 4. Start Ray
+
+On `spark1`, start the head first:
+
+```bash
+.venv/bin/ray stop --force
+.venv/bin/ray start --head \
+  --node-ip-address="$NODE_IP" \
+  --port=6379 \
+  --num-gpus=1 \
+  --num-cpus=0 \
+  --disable-usage-stats \
+  --object-store-memory=200000000 \
+  --include-dashboard=false
+```
+
+Then run this on `spark2`, `spark3`, and `spark4`, with the correct `NODE_IP`
+exported on each machine:
+
+```bash
+.venv/bin/ray stop --force
+.venv/bin/ray start \
+  --address="$HEAD_IP:6379" \
+  --node-ip-address="$NODE_IP" \
+  --num-gpus=1 \
+  --num-cpus=0 \
+  --object-store-memory=200000000
+```
+
+Confirm that the head sees four live nodes:
+
+```bash
+.venv/bin/ray status
+```
+
+### 5. Start Kimi-K3 on spark1
+
+The following is the validated full-residency configuration with a 1M-token
+FP8 DS-MLA KV cache:
+
+```bash
+MODEL=/models/Kimi-K3-w1
+
+.venv/bin/vllm serve "$MODEL" \
+  --served-model-name kimi-k3 \
+  --quantization k3_w1 \
+  --trust-remote-code \
+  --reasoning-parser kimi_k3 \
+  --tensor-parallel-size 2 \
+  --pipeline-parallel-size 2 \
+  --enable-expert-parallel \
+  --expert-placement-strategy round_robin \
+  --distributed-executor-backend ray \
+  --max-model-len 1048576 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 1024 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --gpu-memory-utilization 0.918 \
+  --kv-cache-memory-bytes 9395240960 \
+  --kv-cache-dtype fp8_ds_mla \
+  --no-enable-prefix-caching \
+  --enforce-eager \
+  --kernel-config '{"enable_flashinfer_autotune":false,"enable_cutedsl_warmup":false,"enable_jit_warmup":false}' \
+  --disable-custom-all-reduce \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Initial loading takes several minutes. A successful start reports 46/46 MoE
+layers filled on every rank and approximately 1,076,763 KV-cache tokens.
+
+Verify the server from another machine:
+
+```bash
+curl http://spark1:8000/v1/models
+
+curl http://spark1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "kimi-k3",
+    "messages": [{"role": "user", "content": "Hello from Kimi-K3"}],
+    "max_tokens": 128
+  }'
+```
+
+To shut down the cluster, stop vLLM on `spark1`, then run
+`.venv/bin/ray stop --force` on every node.
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
