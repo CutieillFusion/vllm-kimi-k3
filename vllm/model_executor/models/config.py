@@ -356,6 +356,22 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """
 
     @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+        if model_config.quantization != "k3_w1":
+            return
+
+        parallel_config = vllm_config.parallel_config
+        parallel_config.enable_expert_parallel = True
+        parallel_config.expert_placement_strategy = "round_robin"
+
+        cache_config = vllm_config.cache_config
+        if cache_config.cache_dtype == "auto":
+            cache_config.cache_dtype = "fp8_ds_mla"
+            logger.info("Using fp8_ds_mla KV cache for Kimi-K3 k3_w1")
+        cache_config.enable_prefix_caching = False
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         for cfg in (
             model_config.hf_config,
