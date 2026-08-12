@@ -43,6 +43,7 @@ QuantizationMethods = Literal[
     "int8_per_channel_weight_only",
     "nvfp4_per_token",
     "mxfp8",
+    "k3_w1",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -108,6 +109,12 @@ def register_quantization_config(quantization: str):
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
+    if quantization == "k3_w1":
+        from .k3_w1 import install_k3_w1
+        from .k3_w1.method import KimiK3OneBitConfig
+
+        install_k3_w1()
+        return KimiK3OneBitConfig
 
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS

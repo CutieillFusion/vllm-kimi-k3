@@ -105,6 +105,7 @@ class TritonMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "fp8_ds_mla",
     ]
 
     @classmethod
@@ -114,6 +115,18 @@ class TritonMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 656)
+        return (num_blocks, block_size, head_size)
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
@@ -283,7 +296,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 logits_shape, dtype=torch.float32, device=q.device
             )
 
-        # Add a head dim of 1
+        use_fp8_ds_mla = self.kv_cache_dtype == "fp8_ds_mla"
+
+        # Add a head dim of 1. The packed fp8_ds_mla row stores 512 FP8
+        # latent bytes, four float32 scales, then 64 BF16 RoPE values.
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
@@ -317,6 +333,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             k_scale=layer._k_scale,
             v_scale=layer._k_scale,
             is_mla=True,
+            fp8_ds_mla=use_fp8_ds_mla,
         )
 
         return o, lse

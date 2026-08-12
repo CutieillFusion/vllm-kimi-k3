@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -20,6 +21,14 @@ def _run_test(pg):
         print("Same node test passed! when using torch distributed!")
     else:
         print("Same node test passed! when using StatelessProcessGroup!")
+
+
+def _run_create_failure_test(pg):
+    with patch(
+        "vllm.distributed.parallel_state.shared_memory.SharedMemory",
+        side_effect=OSError("shared memory unavailable"),
+    ):
+        assert not any(in_the_same_node_as(pg, source_rank=0))
 
 
 if __name__ == "__main__":
@@ -47,3 +56,4 @@ if __name__ == "__main__":
                 _run_test(pg)
         else:
             _run_test(pg)
+        _run_create_failure_test(pg)

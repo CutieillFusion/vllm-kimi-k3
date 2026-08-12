@@ -3,6 +3,7 @@
 
 
 # ===================== import region =====================
+import socket
 import threading
 
 import torch
@@ -14,7 +15,6 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
     cudaStream_t,
-    ncclComm_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -26,6 +26,26 @@ from vllm.utils.torch_utils import current_stream
 logger = init_logger(__name__)
 
 _NCCL_SYMM_OPS_REGISTERED = False
+
+_RDMA_ISLANDS = {
+    "spark1": "A",
+    "spark2": "A",
+    "spark3": "B",
+    "spark4": "B",
+}
+
+
+def _net_name_for_group(group: ProcessGroup | StatelessProcessGroup) -> str | None:
+    if not envs.VLLM_RDMA_ISLANDS_ENABLE:
+        return None
+    if isinstance(group, StatelessProcessGroup):
+        return None
+    local_island = _RDMA_ISLANDS.get(socket.gethostname())
+    if local_island is None or dist.get_world_size(group) <= 1:
+        return None
+    islands: list[str | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(islands, local_island, group=group)
+    return "IB" if len(set(islands)) == 1 else "Socket"
 
 
 def register_nccl_symmetric_ops(pynccl_comm):
@@ -133,10 +153,24 @@ class PyNcclCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
         # nccl communicator and stream will use this device
+        net_name = _net_name_for_group(group)
         with torch.accelerator.device_index(device.index):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            if net_name is None:
+                self.comm = self.nccl.ncclCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
+            else:
+                logger.info(
+                    "PyNccl communicator ranks=%s net=%s",
+                    dist.get_process_group_ranks(group),
+                    net_name,
+                )
+                self.comm = self.nccl.ncclCommInitRankConfig(
+                    self.world_size,
+                    self.unique_id,
+                    self.rank,
+                    net_name,
+                )
 
             stream = current_stream()
             # A small all_reduce for warmup.

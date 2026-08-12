@@ -279,6 +279,14 @@ def _device_backend_str(torch_distributed_backend: str | Backend) -> str:
     return f"{_platform_device_type()}:{backend_str}"
 
 
+def _rdma_process_group_options():
+    if not envs.VLLM_RDMA_ISLANDS_ENABLE:
+        return None
+    options = torch.distributed.ProcessGroupNCCL.Options()
+    options.config.net_name = "Socket"
+    return options
+
+
 def _create_subgroups_split_group(
     group_ranks: list[list[int]],
     group_name: str,
@@ -302,6 +310,7 @@ def _create_subgroups_split_group(
         group_desc=f"{group_name}:device",
         backend=device_backend_str,
         timeout=get_distributed_timeout_or_none(),
+        pg_options=_rdma_process_group_options(),
     )
     # CPU subgroup: split_group requires the requested backend filter to
     # include the parent's default device type (= the device the parent PG
@@ -457,6 +466,7 @@ class GroupCoordinator:
                     ranks,
                     backend=torch_distributed_backend,
                     timeout=device_timeout,
+                    pg_options=_rdma_process_group_options(),
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
@@ -548,6 +558,7 @@ class GroupCoordinator:
                 backend=self.torch_distributed_backend,
                 group_desc=group_desc,
                 timeout=device_timeout,
+                pg_options=_rdma_process_group_options(),
             )
             if self.rank in ranks:
                 sibling = pg
@@ -2204,29 +2215,34 @@ def in_the_same_node_as(
     shm = None
 
     try:
-        with contextlib.suppress(OSError):
-            if rank == source_rank:
+        if rank == source_rank:
+            name = None
+            try:
                 # create a shared memory segment
                 shm = shared_memory.SharedMemory(create=True, size=128)
                 assert shm.buf is not None, "Buffer was not created"
                 shm.buf[: len(magic_message)] = magic_message
-                if isinstance(pg, ProcessGroup):
-                    torch.distributed.broadcast_object_list(
-                        [shm.name], src=ranks[source_rank], group=pg
-                    )
-                else:
-                    pg.broadcast_obj(shm.name, src=source_rank)
+                name = shm.name
                 is_in_the_same_node[rank] = 1
+            except OSError:
+                pass
+            if isinstance(pg, ProcessGroup):
+                torch.distributed.broadcast_object_list(
+                    [name], src=ranks[source_rank], group=pg
+                )
             else:
-                # try to open the shared memory segment
-                if isinstance(pg, ProcessGroup):
-                    recv = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, src=ranks[source_rank], group=pg
-                    )
-                    name = recv[0]
-                else:
-                    name = pg.broadcast_obj(None, src=source_rank)
+                pg.broadcast_obj(name, src=source_rank)
+        else:
+            # try to open the shared memory segment
+            if isinstance(pg, ProcessGroup):
+                recv = [None]
+                torch.distributed.broadcast_object_list(
+                    recv, src=ranks[source_rank], group=pg
+                )
+                name = recv[0]
+            else:
+                name = pg.broadcast_obj(None, src=source_rank)
+            if name is not None:
                 # fix to https://stackoverflow.com/q/62748654/9191338
                 # Python incorrectly tracks shared memory even if it is not
                 # created by the process. The following patch is a workaround.

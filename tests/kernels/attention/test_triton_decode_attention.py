@@ -6,9 +6,19 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_triton_mla_fp8_ds_mla_cache_shape():
+    """The packed layout must expose all 656 bytes to the model runner."""
+    assert TritonMLABackend.get_kv_cache_shape(2, 16, 1, 576, "fp8_ds_mla") == (
+        2,
+        16,
+        656,
+    )
 
 
 @pytest.mark.parametrize("B", [3, 5])
@@ -231,6 +241,99 @@ def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE)
 
     # FP8 tolerances match test_mla_backends.py test_backend_correctness.
     torch.testing.assert_close(o_ref, o_fp8, atol=5e-1, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="fp8_ds_mla requires CUDA")
+def test_decode_attention_fp8_ds_mla():
+    """Packed per-tile scales and BF16 RoPE must match a dequantized cache."""
+    torch.manual_seed(0)
+    batch_size = 2
+    num_heads = 16
+    seq_len = 31
+    page_size = 16
+    num_pages = 4
+    num_kv_splits = 2
+
+    latent = torch.randn(
+        num_pages,
+        page_size,
+        1,
+        512,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    rope = torch.randn(
+        num_pages,
+        page_size,
+        1,
+        64,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    latent_tiles = latent.float().reshape(num_pages, page_size, 1, 4, 128)
+    scales = (latent_tiles.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
+    latent_fp8 = (latent_tiles / scales[..., None]).to(torch.float8_e4m3fn)
+
+    packed = torch.empty(
+        num_pages, page_size, 1, 656, dtype=torch.uint8, device=DEVICE_TYPE
+    )
+    packed[..., :512].copy_(latent_fp8.reshape_as(latent).view(torch.uint8))
+    packed[..., 512:528].view(torch.float32).copy_(scales)
+    packed[..., 528:656].view(torch.bfloat16).copy_(rope)
+
+    latent_dequant = (latent_fp8.float() * scales[..., None]).reshape_as(latent)
+    cache_ref = torch.cat((latent_dequant.to(torch.bfloat16), rope), dim=-1)
+    query = torch.randn(
+        batch_size,
+        num_heads,
+        576,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    block_table = torch.tensor([[0, 1], [2, 3]], device=DEVICE_TYPE)
+    seq_lens = torch.full((batch_size,), seq_len, device=DEVICE_TYPE)
+
+    def run(k_buffer, v_buffer, *, fp8_ds_mla=False):
+        output = torch.zeros(
+            batch_size,
+            num_heads,
+            512,
+            dtype=torch.bfloat16,
+            device=DEVICE_TYPE,
+        )
+        lse = torch.zeros(
+            batch_size, num_heads, dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        workspace = torch.empty(
+            batch_size,
+            num_heads,
+            num_kv_splits,
+            513,
+            dtype=torch.float32,
+            device=DEVICE_TYPE,
+        )
+        decode_attention_fwd(
+            query,
+            k_buffer,
+            v_buffer,
+            output,
+            lse,
+            block_table,
+            seq_lens,
+            workspace,
+            num_kv_splits,
+            1.0 / (576**0.5),
+            page_size,
+            is_mla=True,
+            fp8_ds_mla=fp8_ds_mla,
+        )
+        return output, lse
+
+    output_ref, lse_ref = run(cache_ref, cache_ref[..., :512])
+    output_packed, lse_packed = run(packed, packed[..., :512], fp8_ds_mla=True)
+
+    torch.testing.assert_close(output_packed, output_ref, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_packed, lse_ref, atol=2e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
