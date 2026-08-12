@@ -51,6 +51,56 @@ class ncclUniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
 
 
+class ncclConfig(ctypes.Structure):
+    """NCCL 2.28 communicator configuration through ``netName``."""
+
+    _fields_ = [
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+        ("splitShare", ctypes.c_int),
+        ("trafficClass", ctypes.c_int),
+        ("commName", ctypes.c_char_p),
+        ("collnetEnable", ctypes.c_int),
+        ("CTAPolicy", ctypes.c_int),
+        ("shrinkShare", ctypes.c_int),
+        ("nvlsCTAs", ctypes.c_int),
+        ("nChannelsPerNetPeer", ctypes.c_int),
+        ("nvlinkCentricSched", ctypes.c_int),
+    ]
+
+
+def make_nccl_config(net_name: str, version: int) -> ncclConfig:
+    undefined = -2147483648
+    config = ncclConfig()
+    config.size = ctypes.sizeof(ncclConfig)
+    config.magic = 0xCAFEBEEF
+    config.version = version
+    for field in (
+        "blocking",
+        "cgaClusterSize",
+        "minCTAs",
+        "maxCTAs",
+        "splitShare",
+        "trafficClass",
+        "collnetEnable",
+        "CTAPolicy",
+        "shrinkShare",
+        "nvlsCTAs",
+        "nChannelsPerNetPeer",
+        "nvlinkCentricSched",
+    ):
+        setattr(config, field, undefined)
+    config.netName = net_name.encode()
+    config.commName = None
+    return config
+
+
 # NCCL 2.30+ ncclCommProperties_t. Only fields through ginType are read;
 # trailing fields keep the layout aligned with NCCL's versioned structure.
 class ncclCommProperties(ctypes.Structure):
@@ -180,6 +230,17 @@ class NCCLLibrary:
             "ncclCommInitRank",
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
+        ),
+        Function(
+            "ncclCommInitRankConfig",
+            ncclResult_t,
+            [
+                ctypes.POINTER(ncclComm_t),
+                ctypes.c_int,
+                ncclUniqueId,
+                ctypes.c_int,
+                ctypes.POINTER(ncclConfig),
+            ],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -451,6 +512,26 @@ class NCCLLibrary:
         self.NCCL_CHECK(
             self._funcs["ncclCommInitRank"](
                 ctypes.byref(comm), world_size, unique_id, rank
+            )
+        )
+        return comm
+
+    def ncclCommInitRankConfig(
+        self,
+        world_size: int,
+        unique_id: ncclUniqueId,
+        rank: int,
+        net_name: str,
+    ) -> ncclComm_t:
+        comm = ncclComm_t()
+        config = make_nccl_config(net_name, self.ncclGetRawVersion())
+        self.NCCL_CHECK(
+            self._funcs["ncclCommInitRankConfig"](
+                ctypes.byref(comm),
+                world_size,
+                unique_id,
+                rank,
+                ctypes.byref(config),
             )
         )
         return comm

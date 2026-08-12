@@ -279,6 +279,14 @@ def _device_backend_str(torch_distributed_backend: str | Backend) -> str:
     return f"{_platform_device_type()}:{backend_str}"
 
 
+def _rdma_process_group_options():
+    if not envs.VLLM_RDMA_ISLANDS_ENABLE:
+        return None
+    options = torch.distributed.ProcessGroupNCCL.Options()
+    options.config.net_name = "Socket"
+    return options
+
+
 def _create_subgroups_split_group(
     group_ranks: list[list[int]],
     group_name: str,
@@ -302,6 +310,7 @@ def _create_subgroups_split_group(
         group_desc=f"{group_name}:device",
         backend=device_backend_str,
         timeout=get_distributed_timeout_or_none(),
+        pg_options=_rdma_process_group_options(),
     )
     # CPU subgroup: split_group requires the requested backend filter to
     # include the parent's default device type (= the device the parent PG
@@ -457,6 +466,7 @@ class GroupCoordinator:
                     ranks,
                     backend=torch_distributed_backend,
                     timeout=device_timeout,
+                    pg_options=_rdma_process_group_options(),
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
@@ -548,6 +558,7 @@ class GroupCoordinator:
                 backend=self.torch_distributed_backend,
                 group_desc=group_desc,
                 timeout=device_timeout,
+                pg_options=_rdma_process_group_options(),
             )
             if self.rank in ranks:
                 sibling = pg

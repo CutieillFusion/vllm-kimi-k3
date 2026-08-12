@@ -339,6 +339,11 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: KimiK3OneBitConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
+        self.token_chunk = max(0, int(os.environ.get("K3_MOE_TOKEN_CHUNK", "0")))
+        self.activation_config = ApplyMoEActivationConfig(
+            activation_situ_beta=moe.activation_situ_beta,
+            activation_situ_linear_beta=moe.activation_situ_linear_beta,
+        )
 
     def create_weights(
         self,
@@ -435,12 +440,6 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         # That is the point of packing offline rather than at load time.
         return
 
-    def _act_config(self) -> ApplyMoEActivationConfig:
-        return ApplyMoEActivationConfig(
-            activation_situ_beta=self.moe.activation_situ_beta,
-            activation_situ_linear_beta=self.moe.activation_situ_linear_beta,
-        )
-
     def apply(
         self,
         layer: RoutedExperts,
@@ -460,7 +459,7 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         return self._forward_routed(layer, x, topk_weights, topk_ids)
 
     def _forward_routed(self, layer, x, topk_weights, topk_ids) -> torch.Tensor:
-        token_chunk = max(0, int(os.environ.get("K3_MOE_TOKEN_CHUNK", "0")))
+        token_chunk = self.token_chunk
         fully_resident = layer.k3_resident >= layer.k3_num_experts
         if fully_resident and token_chunk and x.shape[0] > token_chunk:
             # Bound the T*top_k MoE temporaries without shrinking vLLM's
@@ -479,6 +478,14 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
                     )
                 )
             return output
+        if fully_resident:
+            return self._forward_routed_chunk(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                layer.expert_map,
+            )
 
         missed = _local_stream_misses(layer, topk_ids)
         n_str = getattr(layer, "k3_stream_slots", 0)
@@ -589,7 +596,12 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
             h = torch.empty(
                 (T * top_k, intermediate_size), dtype=x.dtype, device=x.device
             )
-            apply_moe_activation(act, h, inter, activation_config=self._act_config())
+            apply_moe_activation(
+                act,
+                h,
+                inter,
+                activation_config=self.activation_config,
+            )
         else:
             h = situ_and_mul(
                 inter,
