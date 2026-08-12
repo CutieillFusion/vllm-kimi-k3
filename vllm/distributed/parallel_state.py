@@ -2204,29 +2204,34 @@ def in_the_same_node_as(
     shm = None
 
     try:
-        with contextlib.suppress(OSError):
-            if rank == source_rank:
+        if rank == source_rank:
+            name = None
+            try:
                 # create a shared memory segment
                 shm = shared_memory.SharedMemory(create=True, size=128)
                 assert shm.buf is not None, "Buffer was not created"
                 shm.buf[: len(magic_message)] = magic_message
-                if isinstance(pg, ProcessGroup):
-                    torch.distributed.broadcast_object_list(
-                        [shm.name], src=ranks[source_rank], group=pg
-                    )
-                else:
-                    pg.broadcast_obj(shm.name, src=source_rank)
+                name = shm.name
                 is_in_the_same_node[rank] = 1
+            except OSError:
+                pass
+            if isinstance(pg, ProcessGroup):
+                torch.distributed.broadcast_object_list(
+                    [name], src=ranks[source_rank], group=pg
+                )
             else:
-                # try to open the shared memory segment
-                if isinstance(pg, ProcessGroup):
-                    recv = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, src=ranks[source_rank], group=pg
-                    )
-                    name = recv[0]
-                else:
-                    name = pg.broadcast_obj(None, src=source_rank)
+                pg.broadcast_obj(name, src=source_rank)
+        else:
+            # try to open the shared memory segment
+            if isinstance(pg, ProcessGroup):
+                recv = [None]
+                torch.distributed.broadcast_object_list(
+                    recv, src=ranks[source_rank], group=pg
+                )
+                name = recv[0]
+            else:
+                name = pg.broadcast_obj(None, src=source_rank)
+            if name is not None:
                 # fix to https://stackoverflow.com/q/62748654/9191338
                 # Python incorrectly tracks shared memory even if it is not
                 # created by the process. The following patch is a workaround.
