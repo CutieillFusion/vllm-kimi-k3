@@ -261,9 +261,9 @@ def k3_dense_matmul(
     bits,
     bias=None,
     group_size=I4_GROUP,
-    block_n=64,
-    block_k=128,
-    num_warps=4,
+    block_n=None,
+    block_k=None,
+    num_warps=None,
 ):
     """y = x @ dequant(qweight)^T (+ bias). x is [..., K], result [..., N]."""
     orig = x.shape
@@ -271,6 +271,16 @@ def k3_dense_matmul(
     M, K = a.shape
     N = qweight.shape[0]
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+
+    if block_n is None or block_k is None or num_warps is None:
+        default_config = (64, 128, 4)
+        decode_config = (
+            (32, 128, 2) if bits == 4 and N == 7168 and K == 6144 else default_config
+        )
+        selected = decode_config if M <= GEMV_MAX_TOKENS else default_config
+        block_n = block_n or selected[0]
+        block_k = block_k or selected[1]
+        num_warps = num_warps or selected[2]
 
     if M <= GEMV_MAX_TOKENS:
         grid: tuple[int, ...] = (M, triton.cdiv(N, block_n))
