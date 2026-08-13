@@ -23,7 +23,7 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 This fork can serve the converted Kimi-K3 1-bit model across four DGX Spark
 systems with one GB10 GPU per node. The validated topology is TP=2, PP=2, and
-expert parallelism across all four GPUs. All 896 experts remain resident and
+expert parallelism across all four GPUs (TP=4 is ideal but I don't have the extra cables). All 896 experts remain resident and
 the FP8 DS-MLA KV cache supports the full 1,048,576-token context length.
 
 ### 1. Prepare every Spark
